@@ -14,6 +14,10 @@ Usage:
   python hg-to-git-mirror.py --root /path/to/hg-project --mirror /path/to/git-mirror \
       --interactive [--remote https://github.com/user/repo.git]
 
+  # Exclude paths (subrepos, files, globs) - persisted in the state file
+  python hg-to-git-mirror.py --root /path/to/hg-project --mirror /path/to/git-mirror \
+      --exclude regression --exclude AGENTS.md [--unexclude PATH]
+
 Each project's state is stored in <mirror>/.git/hg-mirror-state.json, so multiple
 projects are fully isolated just by using different --mirror directories.
 
@@ -22,6 +26,7 @@ Works on Windows and FreeBSD/Unix. No pip dependencies - stdlib only.
 
 import argparse
 import datetime
+import fnmatch
 import json
 import os
 import re
@@ -31,7 +36,6 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
-
 
 # ---------------------------------------------------------------------------
 # Subprocess helper
@@ -59,7 +63,6 @@ def run_cmd(args: list, cwd: Path, capture: bool = True, dry_run: bool = False) 
         )
     return result.stdout if capture else ""
 
-
 def run_cmd_bytes(args: list, cwd: Path) -> bytes:
     """Run a command, return raw stdout bytes. Raises on non-zero exit."""
     result = subprocess.run(args, cwd=str(cwd), capture_output=True)
@@ -71,7 +74,6 @@ def run_cmd_bytes(args: list, cwd: Path) -> bytes:
             f"  stderr: {result.stderr.decode('utf-8', errors='replace').strip()}"
         )
     return result.stdout
-
 
 # ---------------------------------------------------------------------------
 # .hgsub parsing
@@ -100,7 +102,6 @@ def read_hgsub(hgsub_path: Path) -> dict:
             entries[local.strip()] = source.strip()
     return entries
 
-
 def discover_subrepos(hg_root: Path) -> dict:
     """
     Recursively walk .hgsub files starting from hg_root.
@@ -121,7 +122,6 @@ def discover_subrepos(hg_root: Path) -> dict:
     _walk_hgsub(hg_root, "", result)
     return result
 
-
 def _walk_hgsub(repo_path: Path, prefix: str, result: dict) -> None:
     hgsub = repo_path / ".hgsub"
     if not hgsub.exists():
@@ -133,13 +133,41 @@ def _walk_hgsub(repo_path: Path, prefix: str, result: dict) -> None:
             result[git_prefix] = subrepo_abs
             _walk_hgsub(subrepo_abs, git_prefix, result)
 
-
 # ---------------------------------------------------------------------------
 # HG helpers
 # ---------------------------------------------------------------------------
 
 HG_SKIP_FILES = {".hgsub", ".hgsubstate", ".hgeol", ".hgtags", ".hgignore"}
 
+def _normalize_path(path: str) -> str:
+    return path.replace("\\", "/").strip().strip("/")
+
+def is_excluded(path: str, excludes: list) -> bool:
+    """
+    Return True if a mirror-relative path matches any exclude pattern.
+
+    A pattern matches the path itself, anything below it (so a directory or
+    subrepo prefix excludes its whole subtree), or the path as an fnmatch glob.
+    """
+    path = _normalize_path(path)
+    for pat in excludes:
+        pat = _normalize_path(pat)
+        if not pat:
+            continue
+        if path == pat or path.startswith(pat + "/") or fnmatch.fnmatchcase(path, pat):
+            return True
+    return False
+
+def filter_repos(repos: dict, excludes: list) -> tuple:
+    """Split repos into (included, excluded_prefixes). The root repo is never excluded."""
+    included = {}
+    excluded = []
+    for prefix, path in repos.items():
+        if prefix and is_excluded(prefix, excludes):
+            excluded.append(prefix)
+        else:
+            included[prefix] = path
+    return included, excluded
 
 def _strip_graph_decorations(text: str) -> str:
     """
@@ -175,7 +203,6 @@ def _strip_graph_decorations(text: str) -> str:
         line for line in text.splitlines()
         if line.strip() and not _pure_graph.match(line)
     )
-
 
 def get_hg_revisions(repo: Path, since_hash: Optional[str], limit: Optional[int],
                      extra_args: Optional[list] = None) -> list:
@@ -240,7 +267,6 @@ def get_hg_revisions(repo: Path, since_hash: Optional[str], limit: Optional[int]
 
     return revisions
 
-
 def merge_commits_preserving_repo_order(commits_by_prefix: dict) -> list:
     """
     Merge per-repo commit queues by date while preserving each repo's rev order.
@@ -266,7 +292,6 @@ def merge_commits_preserving_repo_order(commits_by_prefix: dict) -> list:
         merged.append(chosen)
         indexes[chosen[1]] += 1
 
-
 def export_hg_patch(repo: Path, rev_hash: str) -> bytes:
     """Return raw bytes of the git-format patch for a single HG changeset."""
     return run_cmd_bytes(
@@ -274,20 +299,21 @@ def export_hg_patch(repo: Path, rev_hash: str) -> bytes:
         cwd=repo,
     )
 
-
 # ---------------------------------------------------------------------------
 # Patch path rewriting
 # ---------------------------------------------------------------------------
 
-def rewrite_patch_paths(patch_bytes: bytes, prefix: str) -> bytes:
+def rewrite_patch_paths(patch_bytes: bytes, prefix: str, excludes: Optional[list] = None) -> bytes:
     """
     Given a git-format patch and a subdirectory prefix, rewrite all file paths
     so they appear under that prefix inside the monorepo.
 
-    Also strips changes to HG-specific files (.hgsub, .hgsubstate, .hgeol, .hgtags).
+    Also strips changes to HG-specific files (.hgsub, .hgsubstate, .hgeol, .hgtags)
+    and to any file whose mirror path matches an exclude pattern.
 
     If prefix is "" (root repo), path rewriting is skipped but file stripping still applies.
     """
+    excludes = excludes or []
     patch_text = patch_bytes.decode("utf-8", errors="replace")
     lines = patch_text.splitlines(keepends=True)
     output_lines = []
@@ -296,7 +322,7 @@ def rewrite_patch_paths(patch_bytes: bytes, prefix: str) -> bytes:
     for line in lines:
         # Detect start of a file diff section
         if line.startswith("diff --git "):
-            skip_until_next_diff = _should_skip_diff_line(line)
+            skip_until_next_diff = _should_skip_diff_line(line, prefix, excludes)
             if skip_until_next_diff:
                 continue
             if prefix:
@@ -310,16 +336,24 @@ def rewrite_patch_paths(patch_bytes: bytes, prefix: str) -> bytes:
 
     return "".join(output_lines).encode("utf-8")
 
-
-def _should_skip_diff_line(line: str) -> bool:
+def _should_skip_diff_line(line: str, prefix: str = "", excludes: Optional[list] = None) -> bool:
     """Return True if this diff --git line references a file we want to exclude."""
     # Extract filenames from: diff --git a/foo b/foo
-    match = re.match(r"diff --git a/(.+?) b/(.+)", line)
+    match = re.match(r"diff --git a/(.+?) b/(.+)", line.rstrip("\r\n"))
     if not match:
         return False
-    filename = Path(match.group(1)).name
-    return filename in HG_SKIP_FILES
+    a_path, b_path = match.group(1), match.group(2)
+    if Path(a_path).name in HG_SKIP_FILES:
+        return True
+    if excludes:
+        base = f"{prefix}/" if prefix else ""
+        if is_excluded(base + a_path, excludes) or is_excluded(base + b_path, excludes):
+            return True
+    return False
 
+def patch_has_changes(patch_bytes: bytes) -> bool:
+    """Return True if a (rewritten) patch still contains at least one file diff."""
+    return any(line.startswith(b"diff --git ") for line in patch_bytes.splitlines())
 
 def _rewrite_diff_git_line(line: str, prefix: str) -> str:
     """Rewrite the 'diff --git a/X b/X' header line."""
@@ -329,10 +363,8 @@ def _rewrite_diff_git_line(line: str, prefix: str) -> str:
         line,
     )
 
-
 _PATH_LINE_PREFIXES = ("--- a/", "+++ b/", "--- /dev/null", "+++ /dev/null",
                        "rename from ", "rename to ", "copy from ", "copy to ")
-
 
 def _rewrite_path_line(line: str, prefix: str) -> str:
     """Rewrite a/b path lines in a patch to include the subdirectory prefix."""
@@ -343,7 +375,6 @@ def _rewrite_path_line(line: str, prefix: str) -> str:
         if line.startswith(pat):
             return pat + prefix + "/" + line[len(pat):]
     return line
-
 
 # ---------------------------------------------------------------------------
 # Git helpers
@@ -358,6 +389,7 @@ def apply_snapshot_commit(
     date_str: str,
     message: str,
     all_prefixes: set,
+    excludes: Optional[list] = None,
     dry_run: bool = False,
 ) -> None:
     """
@@ -371,7 +403,10 @@ def apply_snapshot_commit(
     `all_prefixes` is the full set of subrepo prefixes so that child subrepo
     directories (e.g. "framework/sdk" when prefix is "framework") are preserved
     during cleanup and not accidentally staged as deletions.
+
+    Files whose mirror path matches one of `excludes` are not copied.
     """
+    excludes = excludes or []
     dest = (mirror / prefix) if prefix else mirror
 
     # Determine direct child subrepo directory names to preserve
@@ -414,6 +449,9 @@ def apply_snapshot_commit(
             if src.name in HG_SKIP_FILES or src.name == ".hg_archival.txt":
                 continue
             rel = src.relative_to(snapshot_dir)
+            mirror_rel = f"{prefix}/{rel.as_posix()}" if prefix else rel.as_posix()
+            if is_excluded(mirror_rel, excludes):
+                continue
             dst = dest / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
@@ -435,14 +473,12 @@ def apply_snapshot_commit(
         cwd=mirror,
     )
 
-
 def _split_author(author: str) -> tuple:
     """Split 'Name <email>' into (name, email). Falls back gracefully."""
     match = re.match(r"^(.*?)\s*<([^>]*)>", author)
     if match:
         return match.group(1).strip() or "Unknown", match.group(2).strip()
     return author.strip() or "Unknown", "unknown@unknown"
-
 
 def apply_patch(mirror: Path, patch_bytes: bytes, dry_run: bool = False) -> bool:
     """
@@ -478,7 +514,6 @@ def apply_patch(mirror: Path, patch_bytes: bytes, dry_run: bool = False) -> bool
     finally:
         os.unlink(patch_path)
 
-
 def init_git_repo(mirror: Path, dry_run: bool = False) -> None:
     """Initialize a new bare-ish Git repo (with a working tree) in mirror."""
     if dry_run:
@@ -495,7 +530,6 @@ def init_git_repo(mirror: Path, dry_run: bool = False) -> None:
         except RuntimeError:
             pass  # Already on main or branch rename not needed
     run_cmd(["git", "config", "core.autocrlf", "false"], cwd=mirror)
-
 
 # ---------------------------------------------------------------------------
 # HG metadata -> Git metadata conversion (.hgeol -> .gitattributes, .hgignore -> .gitignore)
@@ -534,7 +568,6 @@ def _gitattributes_from_hgeol(hgeol_path: Path) -> Optional[str]:
     if len(out) <= 2:
         return None
     return "\n".join(out) + "\n"
-
 
 def _gitignore_from_hgignore(hgignore_path: Path) -> Optional[str]:
     """
@@ -579,7 +612,6 @@ def _gitignore_from_hgignore(hgignore_path: Path) -> Optional[str]:
     if all(l.startswith("#") or l == "" for l in out):
         return None
     return "\n".join(out) + "\n"
-
 
 def apply_git_metadata(mirror: Path, repos: dict, dry_run: bool = False) -> None:
     """
@@ -629,7 +661,6 @@ def apply_git_metadata(mirror: Path, repos: dict, dry_run: bool = False) -> None
         cwd=mirror,
     )
 
-
 # ---------------------------------------------------------------------------
 # State management
 # ---------------------------------------------------------------------------
@@ -637,12 +668,10 @@ def apply_git_metadata(mirror: Path, repos: dict, dry_run: bool = False) -> None
 STATE_FILENAME = "hg-mirror-state.json"
 REFRESH_BAT_FILENAME = "hg-mirror-refresh.bat"
 
-
 def state_file_path(mirror: Path, override: Optional[Path]) -> Path:
     if override:
         return override
     return mirror / ".git" / STATE_FILENAME
-
 
 def load_state(mirror: Path, override: Optional[Path]) -> dict:
     path = state_file_path(mirror, override)
@@ -650,12 +679,54 @@ def load_state(mirror: Path, override: Optional[Path]) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     return {"version": 1, "repos": {}}
 
-
 def save_state(mirror: Path, override: Optional[Path], state: dict) -> None:
     path = state_file_path(mirror, override)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
+def resolve_excludes(saved: list, add: list, remove: list) -> list:
+    """Return the saved exclude list plus `add`, minus `remove` (order preserved)."""
+    remove_set = {_normalize_path(p) for p in remove}
+    result = []
+    for pat in list(saved) + list(add):
+        pat = _normalize_path(pat)
+        if pat and pat not in remove_set and pat not in result:
+            result.append(pat)
+    return result
+
+def remove_excluded_from_mirror(mirror: Path, patterns: list, dry_run: bool = False) -> bool:
+    """
+    Delete tracked files matching newly added exclude patterns from the mirror
+    and commit the removal. Earlier history is left untouched.
+    Returns True if a commit was made (or would be, in dry-run mode).
+    """
+    if not (mirror / ".git").exists():
+        return False
+    tracked = run_cmd(["git", "-c", "core.quotepath=off", "ls-files", "-z"], cwd=mirror)
+    paths = [p for p in tracked.split("\0") if p and is_excluded(p, patterns)]
+    if not paths:
+        return False
+
+    print(f"Removing {len(paths)} newly excluded file(s) from the mirror...")
+    if dry_run:
+        for p in paths[:20]:
+            print(f"  [dry-run] git rm {p}")
+        if len(paths) > 20:
+            print(f"  [dry-run] ... and {len(paths) - 20} more")
+        print()
+        return True
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="wb") as f:
+        f.write(b"\0".join(p.encode("utf-8") for p in paths))
+        pathspec_file = f.name
+    try:
+        run_cmd(["git", "rm", "-r", "-q", "--ignore-unmatch",
+                 f"--pathspec-from-file={pathspec_file}", "--pathspec-file-nul"], cwd=mirror)
+    finally:
+        os.unlink(pathspec_file)
+    run_cmd(["git", "commit", "-m", f"Stop mirroring: {', '.join(patterns)}"], cwd=mirror)
+    print()
+    return True
 
 def write_refresh_bat(mirror: Path, hg_root: Path, remote: str) -> None:
     """
@@ -674,7 +745,6 @@ def write_refresh_bat(mirror: Path, hg_root: Path, remote: str) -> None:
     bat_path.parent.mkdir(parents=True, exist_ok=True)
     bat_path.write_text(content, encoding="utf-8")
     print(f"Refresh script : {bat_path}")
-
 
 # ---------------------------------------------------------------------------
 # Main sync logic
@@ -700,20 +770,47 @@ def sync_mirror(args: argparse.Namespace) -> None:
         print("Initializing Git mirror...")
         init_git_repo(mirror, dry_run=dry_run)
 
-    # --- Discover subrepos ---
-    print("Discovering subrepos...")
-    repos = discover_subrepos(hg_root)
-    for prefix, path in sorted(repos.items()):
-        label = f'"{prefix}"' if prefix else "(root)"
-        print(f"  {label:30s} -> {path}")
-    print()
-
     # --- Load state ---
     state = load_state(mirror, state_override)
+
+    # --- Resolve exclude patterns (persisted in state) ---
+    saved_excludes = state.get("excludes", [])
+    excludes = resolve_excludes(saved_excludes, args.exclude, args.unexclude)
+    excludes_changed = excludes != saved_excludes
+    state["excludes"] = excludes
+    if excludes:
+        print("Excludes :")
+        for pat in excludes:
+            print(f"  {pat}")
+        print()
+
+    # --- Discover subrepos ---
+    print("Discovering subrepos...")
+    all_repos = discover_subrepos(hg_root)
+    repos, excluded_prefixes = filter_repos(all_repos, excludes)
+    for prefix, path in sorted(all_repos.items()):
+        label = f'"{prefix}"' if prefix else "(root)"
+        suffix = "  (excluded)" if prefix in excluded_prefixes else ""
+        print(f"  {label:30s} -> {path}{suffix}")
+    print()
+    # Forget sync state for excluded subrepos so un-excluding re-seeds them from a snapshot
+    for prefix in excluded_prefixes:
+        state["repos"].pop(prefix, None)
+
+    # --- Remove newly excluded paths from an existing mirror ---
+    removed = False
+    if not args.init:
+        added = [pat for pat in excludes if pat not in saved_excludes]
+        if added:
+            removed = remove_excluded_from_mirror(mirror, added, dry_run=dry_run)
 
     # --- Collect all new commits across all repos ---
     print("Collecting new commits...")
     commits_by_prefix = {}  # prefix -> list of (date_str, prefix, repo_path, rev_hash, author, message)
+    # Prefixes with no sync state on an incremental run (newly added or
+    # un-excluded subrepos): seed them with a snapshot of their latest revision,
+    # since their earlier history was never mirrored and patches can't apply.
+    snapshot_prefixes: set = set()
 
     for prefix, repo_path in repos.items():
         since_hash = state["repos"].get(prefix)
@@ -721,10 +818,14 @@ def sync_mirror(args: argparse.Namespace) -> None:
 
         if args.init:
             revisions = get_hg_revisions(repo_path, since_hash=None, limit=args.recent_commits)
+        elif since_hash is None:
+            revisions = get_hg_revisions(repo_path, since_hash=None, limit=1)
+            snapshot_prefixes.add(prefix)
         else:
             revisions = get_hg_revisions(repo_path, since_hash=since_hash, limit=None)
 
-        print(f"  {label:30s}: {len(revisions)} new commit(s)")
+        note = "  (not mirrored yet; seeding from latest snapshot)" if prefix in snapshot_prefixes else ""
+        print(f"  {label:30s}: {len(revisions)} new commit(s){note}")
         repo_commits = []
         for rev in revisions:
             repo_commits.append((rev["date"], prefix, repo_path, rev["hash"], rev["author"], rev["message"]))
@@ -732,8 +833,10 @@ def sync_mirror(args: argparse.Namespace) -> None:
 
     all_commits = merge_commits_preserving_repo_order(commits_by_prefix)
 
-    if not all_commits:
+    if not all_commits and not removed:
         print("\nNothing to sync. Mirror is up to date.")
+        if excludes_changed and not dry_run:
+            save_state(mirror, state_override, state)
         return
 
     print(f"\nApplying {len(all_commits)} commit(s) in chronological order...")
@@ -752,26 +855,31 @@ def sync_mirror(args: argparse.Namespace) -> None:
         short_hash = rev_hash[:12]
         print(f"  [{date_str}] {label} {short_hash}  {message[:60]}")
 
-        if args.init:
+        if args.init or prefix in snapshot_prefixes:
             # In init mode always use full snapshots - diffs can't apply cleanly
             # against a partial history (we're only seeding the last N commits).
             apply_snapshot_commit(mirror, repo_path, rev_hash, prefix,
                                   author, date_str, message,
                                   all_prefixes=set(repos.keys()),
+                                  excludes=excludes,
                                   dry_run=dry_run)
             applied += 1
+            latest_hashes[prefix] = rev_hash
         else:
             patch_bytes = export_hg_patch(repo_path, rev_hash)
-            rewritten = rewrite_patch_paths(patch_bytes, prefix)
+            rewritten = rewrite_patch_paths(patch_bytes, prefix, excludes)
+            if not patch_has_changes(rewritten):
+                # Only excluded or HG metadata files changed - nothing to commit,
+                # but advance the state past this changeset.
+                print("    (skipped: only excluded/hg-metadata changes)")
+                latest_hashes[prefix] = rev_hash
+                continue
             ok = apply_patch(mirror, rewritten, dry_run=dry_run)
             if ok:
                 applied += 1
                 latest_hashes[prefix] = rev_hash
             else:
                 blocked_prefixes.add(prefix)
-
-        if args.init:
-            latest_hashes[prefix] = rev_hash
 
     # --- Apply Git metadata files last (initial setup only) ---
     # Done after history so snapshot commits don't wipe out the generated files.
@@ -810,7 +918,6 @@ def sync_mirror(args: argparse.Namespace) -> None:
     if not dry_run:
         write_refresh_bat(mirror, hg_root, args.remote)
 
-
 # ---------------------------------------------------------------------------
 # Interactive TUI
 # ---------------------------------------------------------------------------
@@ -827,7 +934,6 @@ def _get_pending_counts(hg_root: Path, repos: dict, state: dict) -> dict:
             counts[prefix] = -1  # unknown
     return counts
 
-
 def _get_remote_url(mirror: Path) -> str:
     try:
         result = subprocess.run(
@@ -839,7 +945,6 @@ def _get_remote_url(mirror: Path) -> str:
     except Exception:
         pass
     return ""
-
 
 def _short_desc(repos: dict, state: dict) -> list:
     """Return list of (prefix_label, hash_short, message_short, date_str) for display."""
@@ -860,7 +965,6 @@ def _short_desc(repos: dict, state: dict) -> list:
         rows.append((label, h[:12] if h else "-", "-", "-"))
     return rows
 
-
 def _print_status(hg_root: Path, mirror: Path, repos: dict, state: dict, remote: str) -> int:
     """Print mirror status table. Returns total pending commit count."""
     os.system("cls" if os.name == "nt" else "clear")
@@ -870,6 +974,8 @@ def _print_status(hg_root: Path, mirror: Path, repos: dict, state: dict, remote:
     print(f"  HG root : {hg_root}")
     print(f"  Mirror  : {mirror}")
     print(f"  Remote  : {remote or 'not configured'}")
+    excludes = state.get("excludes", [])
+    print(f"  Exclude : {', '.join(excludes) if excludes else 'none'}")
     print()
 
     # Pending counts
@@ -893,7 +999,6 @@ def _print_status(hg_root: Path, mirror: Path, repos: dict, state: dict, remote:
     print()
     return total_pending
 
-
 def run_interactive(args: argparse.Namespace) -> None:
     hg_root = Path(args.root).resolve()
     mirror = Path(args.mirror).resolve()
@@ -902,8 +1007,10 @@ def run_interactive(args: argparse.Namespace) -> None:
 
     while True:
         # Reload state and repos each loop so display reflects latest changes
-        repos = discover_subrepos(hg_root)
         state = load_state(mirror, state_override)
+        state["excludes"] = resolve_excludes(state.get("excludes", []),
+                                             args.exclude, args.unexclude)
+        repos, _excluded = filter_repos(discover_subrepos(hg_root), state["excludes"])
         cur_remote = _get_remote_url(mirror) or remote
 
         _print_status(hg_root, mirror, repos, state, cur_remote)
@@ -938,6 +1045,7 @@ def run_interactive(args: argparse.Namespace) -> None:
                 root=str(hg_root), mirror=str(mirror), remote=cur_remote,
                 recent_commits=n, init=True, dry_run=False,
                 state_file=str(state_override) if state_override else "",
+                exclude=args.exclude, unexclude=args.unexclude,
             )
             try:
                 sync_mirror(sub)
@@ -950,6 +1058,7 @@ def run_interactive(args: argparse.Namespace) -> None:
                 root=str(hg_root), mirror=str(mirror), remote="",
                 recent_commits=args.recent_commits, init=False, dry_run=False,
                 state_file=str(state_override) if state_override else "",
+                exclude=args.exclude, unexclude=args.unexclude,
             )
             try:
                 sync_mirror(sub)
@@ -965,6 +1074,7 @@ def run_interactive(args: argparse.Namespace) -> None:
                     root=str(hg_root), mirror=str(mirror), remote=cur_remote,
                     recent_commits=args.recent_commits, init=False, dry_run=False,
                     state_file=str(state_override) if state_override else "",
+                    exclude=args.exclude, unexclude=args.unexclude,
                 )
                 # Push only - fake an already-synced run by setting all counts to 0
                 # by directly calling the push logic
@@ -983,6 +1093,7 @@ def run_interactive(args: argparse.Namespace) -> None:
                 root=str(hg_root), mirror=str(mirror), remote=cur_remote,
                 recent_commits=args.recent_commits, init=False, dry_run=False,
                 state_file=str(state_override) if state_override else "",
+                exclude=args.exclude, unexclude=args.unexclude,
             )
             try:
                 sync_mirror(sub)
@@ -1008,7 +1119,6 @@ def run_interactive(args: argparse.Namespace) -> None:
             print("  Unknown choice. Please enter 1-5 or q.")
             input("  Press Enter to continue...")
 
-
 def _do_push(mirror: Path, remote: str) -> None:
     """Push the mirror to the remote (set remote URL if needed)."""
     try:
@@ -1020,8 +1130,6 @@ def _do_push(mirror: Path, remote: str) -> None:
     except RuntimeError:
         run_cmd(["git", "push"], cwd=mirror)
     print("Push complete.")
-
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -1058,6 +1166,15 @@ def main() -> None:
         help="Launch a looping menu TUI for managing the mirror.",
     )
     parser.add_argument(
+        "--exclude", action="append", default=[], metavar="PATH",
+        help="Exclude a mirror-relative path, subrepo or glob (repeatable). "
+             "Saved in the state file and applied to all later syncs.",
+    )
+    parser.add_argument(
+        "--unexclude", action="append", default=[], metavar="PATH",
+        help="Remove a previously saved exclude pattern (repeatable).",
+    )
+    parser.add_argument(
         "--state-file", default="", metavar="PATH",
         help="Override location of hg-mirror-state.json "
              "(default: <mirror>/.git/hg-mirror-state.json).",
@@ -1068,7 +1185,6 @@ def main() -> None:
         run_interactive(args)
     else:
         sync_mirror(args)
-
 
 if __name__ == "__main__":
     main()

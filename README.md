@@ -56,6 +56,24 @@ python hgit-mirror.py --root D:\path\to\hg-project --mirror D:\path\to\git-mirro
 
 Interactive mode shows pending commits per subrepo and provides menu actions for init, sync, push, sync plus push, and setting the remote URL.
 
+### Excluding paths
+
+Use `--exclude` to keep subrepos, directories or files out of the mirror:
+
+```powershell
+python hgit-mirror.py --root "D:\code\projects\aamp (2)" --mirror D:\path\to\git-mirror --init --exclude regression --exclude AGENTS.md
+```
+
+Exclude patterns are saved in the state file, so later syncs (including the refresh script) keep applying them without repeating the flags. Use `--unexclude PATH` to remove a saved pattern. Both flags can be repeated.
+
+Patterns are paths relative to the mirror root:
+
+- `regression` excludes that subrepo or directory and everything below it.
+- `AGENTS.md` excludes only the file at the mirror root.
+- Glob patterns are matched with `fnmatch`, so `*AGENTS.md` excludes the file at every level.
+
+Adding an exclude to an existing mirror commits the removal of the matching files (`Stop mirroring: ...`). Earlier Git history still contains them; re-create the mirror with `--init` if they must be gone from history. Un-excluding a subrepo seeds it with a snapshot of its latest revision.
+
 ## How it works
 
 1. Discovers subrepos by recursively reading `.hgsub` files.
