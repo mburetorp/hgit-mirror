@@ -28,6 +28,8 @@ By default, initial setup imports the most recent 100 commits from each discover
 python hgit-mirror.py --root D:\path\to\hg-project --mirror D:\path\to\git-mirror --init --recent-commits 250
 ```
 
+Use `--recent-commits 0` to import the complete history of each included repo.
+
 To configure and push to GitHub during setup:
 
 ```powershell
@@ -72,7 +74,29 @@ Patterns are paths relative to the mirror root:
 - `AGENTS.md` excludes only the file at the mirror root.
 - Glob patterns are matched with `fnmatch`, so `*AGENTS.md` excludes the file at every level.
 
-Adding an exclude to an existing mirror commits the removal of the matching files (`Stop mirroring: ...`). Earlier Git history still contains them; re-create the mirror with `--init` if they must be gone from history. Un-excluding a subrepo seeds it with a snapshot of its latest revision.
+Adding an exclude to an existing mirror commits the removal of the matching files with the generic message `Update mirror exclusions`. Earlier Git history still contains them; create a fresh mirror with `--init` if they must be gone from history. Un-excluding a subrepo seeds it with a snapshot of its latest revision.
+
+### Redacting commit messages
+
+Use repeatable `--redact TEXT` options to replace sensitive terms in commit messages with `***`:
+
+```powershell
+python hgit-mirror.py --root D:\private\aamp --mirror D:\private\aamp-git --init --recent-commits 0 --exclude regression --exclude AGENTS.md --exclude "*/AGENTS.md" --redact "Sensitive Project" --redact "Client Name"
+```
+
+Matching is literal and case-insensitive, including matches inside longer words, paths, and URLs. Each match becomes exactly three asterisks. Overlapping terms are matched longest-first in one pass. Blank terms are rejected.
+
+The full message (subject and body) is preserved with these replacements. Generated commit messages and message previews use the same replacements. Redaction terms are saved in the state file inside `.git`, so later syncs, the refresh script, and interactive operations reuse them. Repeating `--redact` adds terms to the saved list, even when there are no pending commits.
+
+Exclusions control imported paths; redaction controls message text. Excluded names do not automatically become redaction terms. Included file contents, paths, and author identities are unchanged. New redaction terms apply to future imports; recreate the mirror to apply them to all history.
+
+### Empty commits
+
+Both initial conversion and later syncs discard revisions whose filtered tree has no changes. This includes revisions that only change excluded files or Mercurial metadata, such as subrepo pointers. Their messages do not become Git commits. Mixed revisions retain their included changes and use the redacted message.
+
+Skipped revisions still advance the sync state and are reported separately, so later runs do not retry them. A first snapshot containing included files creates a seed commit even if that revision originally changed only an excluded file. Its message is also redacted.
+
+A fresh mirror with no included files remains without a Git commit until there are included changes (or generated Git metadata). Application failures stop the run, preserving the last successfully processed revision.
 
 ## How it works
 
@@ -83,7 +107,7 @@ Adding an exclude to an existing mirror commits the removal of the matching file
 5. Converts `.hgeol` to `.gitattributes` and `.hgignore` to `.gitignore` during initial setup.
 6. Stores the last synced Mercurial revision per repo in `.git/hg-mirror-state.json`.
 
-Initial setup uses full snapshots for each imported commit because a partial history window may not contain the parent commits required for patch application. Incremental sync uses `hg export --git` and `git am`.
+Initial setup uses full snapshots for each imported commit because a partial history window may not contain the parent commits required for patch application. Incremental sync uses `hg diff --git -c` and `git apply --index`, then creates a commit with the sanitized message, original author, and original author date. Messages are sanitized before committing.
 
 ## State and generated files
 
@@ -117,3 +141,13 @@ python hgit-mirror.py --root D:\path\to\hg-project --mirror D:\path\to\git-mirro
 - If `--remote` is omitted, the script syncs locally and skips pushing.
 - Mercurial metadata files such as `.hgsub`, `.hgsubstate`, `.hgeol`, `.hgtags`, and `.hgignore` are excluded from mirrored content.
 - `.hgignore` regular-expression patterns cannot be converted exactly to `.gitignore`; the generated `.gitignore` comments those patterns for manual review.
+
+## Tests
+
+Run the regression suite with Python, Git, and Mercurial installed:
+
+```powershell
+python -B -m unittest -v test_hgit_mirror
+```
+
+The tests create disposable repositories and do not modify your source repositories or mirrors.

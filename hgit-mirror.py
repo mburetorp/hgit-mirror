@@ -18,6 +18,10 @@ Usage:
   python hg-to-git-mirror.py --root /path/to/hg-project --mirror /path/to/git-mirror \
       --exclude regression --exclude AGENTS.md [--unexclude PATH]
 
+  # Mask sensitive text in commit messages (repeatable, persisted in state)
+  python hg-to-git-mirror.py --root /path/to/hg-project --mirror /path/to/git-mirror \
+      --redact "Sensitive Project"
+
 Each project's state is stored in <mirror>/.git/hg-mirror-state.json, so multiple
 projects are fully isolated just by using different --mirror directories.
 
@@ -169,6 +173,28 @@ def filter_repos(repos: dict, excludes: list) -> tuple:
             included[prefix] = path
     return included, excluded
 
+def redaction_term(value: str) -> str:
+    """Validate a literal redaction term without changing its contents."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("redaction terms must not be blank")
+    return value
+
+def resolve_redactions(saved: list, added: list) -> list:
+    """Keep saved terms and append new terms, preserving their order."""
+    return list(dict.fromkeys(redaction_term(term) for term in [*saved, *added]))
+
+def redact_message(message: str, terms: Optional[list] = None) -> str:
+    """Mask literal matches once, longest-first, throughout the whole message."""
+    if not terms:
+        return message
+    pattern = "|".join(re.escape(term) for term in sorted(terms, key=len, reverse=True))
+    return re.sub(pattern, "***", message, flags=re.IGNORECASE)
+
+def message_subject(message: str, terms: Optional[list] = None) -> str:
+    """Sanitize before truncation so a partial preview cannot leak a term."""
+    lines = redact_message(message, terms).splitlines()
+    return lines[0] if lines else ""
+
 def _strip_graph_decorations(text: str) -> str:
     """
     Strip mercurial --graph decoration from `hg log -T json` output.
@@ -250,14 +276,15 @@ def get_hg_revisions(repo: Path, since_hash: Optional[str], limit: Optional[int]
         # date is [unix_timestamp, utc_offset_seconds]
         ts, tz_offset = entry["date"]
         # Format as ISO-8601-ish for sorting; offset is in seconds (positive = west of UTC)
-        dt = datetime.datetime.fromtimestamp(ts - tz_offset, tz=datetime.timezone.utc)
-        date_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        tz = datetime.timezone(datetime.timedelta(seconds=-tz_offset))
+        dt = datetime.datetime.fromtimestamp(ts, tz=tz)
+        date_str = dt.isoformat(sep=" ")
         revisions.append({
             "rev": entry.get("rev", 0),
             "hash": entry["node"],
             "date": date_str,
             "author": entry["user"],
-            "message": entry["desc"].splitlines()[0] if entry["desc"] else "",
+            "message": entry["desc"],
         })
 
     # Mercurial output defaults to newest-first. Apply oldest-first by local rev
@@ -288,14 +315,14 @@ def merge_commits_preserving_repo_order(commits_by_prefix: dict) -> list:
         if not candidates:
             return merged
 
-        chosen = min(candidates, key=lambda commit: commit[0])
+        chosen = min(candidates, key=lambda commit: datetime.datetime.fromisoformat(commit[0]))
         merged.append(chosen)
         indexes[chosen[1]] += 1
 
 def export_hg_patch(repo: Path, rev_hash: str) -> bytes:
-    """Return raw bytes of the git-format patch for a single HG changeset."""
+    """Return a git-format diff without embedding the original commit message."""
     return run_cmd_bytes(
-        ["hg", "export", "--git", "-r", rev_hash],
+        ["hg", "diff", "--git", "-c", rev_hash],
         cwd=repo,
     )
 
@@ -380,6 +407,38 @@ def _rewrite_path_line(line: str, prefix: str) -> str:
 # Git helpers
 # ---------------------------------------------------------------------------
 
+def commit_staged(
+    mirror: Path,
+    message: str,
+    author: Optional[str] = None,
+    date_str: Optional[str] = None,
+    redact: Optional[list] = None,
+    dry_run: bool = False,
+) -> bool:
+    """Commit a changed index with a sanitized message; False means no changes."""
+    message = redact_message(message, redact)
+    if dry_run:
+        print(f"  [dry-run] commit if staged files changed: {message!r}")
+        return True
+    # With an unborn HEAD Git compares the index to an empty tree.
+    if not run_cmd(["git", "diff", "--cached", "--name-only", "-z"], cwd=mirror):
+        return False
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="wb") as f:
+        f.write(message.encode("utf-8"))
+        message_path = f.name
+    try:
+        cmd = ["git", "commit", "--no-gpg-sign", "--cleanup=verbatim",
+               "--allow-empty-message", "--file", message_path]
+        if author is not None:
+            name, email = _split_author(author)
+            cmd += ["--author", f"{name} <{email}>"]
+        if date_str is not None:
+            cmd += ["--date", date_str]
+        run_cmd(cmd, cwd=mirror)
+    finally:
+        os.unlink(message_path)
+    return True
+
 def apply_snapshot_commit(
     mirror: Path,
     repo: Path,
@@ -391,7 +450,8 @@ def apply_snapshot_commit(
     all_prefixes: set,
     excludes: Optional[list] = None,
     dry_run: bool = False,
-) -> None:
+    redact: Optional[list] = None,
+) -> bool:
     """
     Apply the full file tree of a repo at rev_hash as a Git commit.
     Used for the first commit from each subrepo, where we can't apply a diff because
@@ -419,7 +479,7 @@ def apply_snapshot_commit(
 
     if dry_run:
         print(f"  [dry-run] hg archive -r {rev_hash[:12]}  -> {dest}  (preserving: {child_dir_names})")
-        return
+        return commit_staged(mirror, message, author, date_str, redact, dry_run=True)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         snapshot_dir = Path(tmpdir) / "snap"
@@ -460,18 +520,7 @@ def apply_snapshot_commit(
     stage_path = str(prefix) if prefix else "."
     run_cmd(["git", "-c", "core.autocrlf=false", "add", stage_path], cwd=mirror)
 
-    # Commit with original HG author and date
-    author_name, author_email = _split_author(author)
-    run_cmd(
-        [
-            "git", "commit",
-            "--allow-empty",
-            "-m", message,
-            "--author", f"{author_name} <{author_email}>",
-            "--date", date_str,
-        ],
-        cwd=mirror,
-    )
+    return commit_staged(mirror, message, author, date_str, redact)
 
 def _split_author(author: str) -> tuple:
     """Split 'Name <email>' into (name, email). Falls back gracefully."""
@@ -482,11 +531,11 @@ def _split_author(author: str) -> tuple:
 
 def apply_patch(mirror: Path, patch_bytes: bytes, dry_run: bool = False) -> bool:
     """
-    Apply a git-format patch to the mirror repo using git am.
-    Returns True on success, False if the patch had nothing to apply (empty diff).
-    Raises on error.
+    Apply a git-format patch to the working tree and index, without committing.
+    Returns False for an empty diff. Application failures raise without being
+    mistaken for excluded-only changes.
     """
-    if not patch_bytes.strip():
+    if not patch_has_changes(patch_bytes):
         return False
 
     with tempfile.NamedTemporaryFile(suffix=".patch", delete=False, mode="wb") as f:
@@ -494,23 +543,8 @@ def apply_patch(mirror: Path, patch_bytes: bytes, dry_run: bool = False) -> bool
         patch_path = f.name
 
     try:
-        if dry_run:
-            print(f"  [dry-run] git am {patch_path}  (cwd={mirror})")
-            return True
-        try:
-            run_cmd(
-                ["git", "am", "--no-gpg-sign", "--keep-cr", "--keep", patch_path],
-                cwd=mirror,
-            )
-            return True
-        except RuntimeError as exc:
-            # If the patch is empty or already applied, skip it.
-            if "does not apply" in str(exc) or "nothing to apply" in str(exc).lower():
-                if (mirror / ".git" / "rebase-apply").exists():
-                    run_cmd(["git", "am", "--abort"], cwd=mirror, dry_run=False)
-                print(f"  Warning: patch did not apply cleanly, skipping.")
-                return False
-            raise
+        run_cmd(["git", "apply", "--index", "--", patch_path], cwd=mirror, dry_run=dry_run)
+        return True
     finally:
         os.unlink(patch_path)
 
@@ -613,7 +647,8 @@ def _gitignore_from_hgignore(hgignore_path: Path) -> Optional[str]:
         return None
     return "\n".join(out) + "\n"
 
-def apply_git_metadata(mirror: Path, repos: dict, dry_run: bool = False) -> None:
+def apply_git_metadata(mirror: Path, repos: dict, dry_run: bool = False,
+                       redact: Optional[list] = None) -> None:
     """
     Convert HG metadata files to Git equivalents for all repos and commit them.
 
@@ -627,7 +662,8 @@ def apply_git_metadata(mirror: Path, repos: dict, dry_run: bool = False) -> None
 
     for prefix, repo_path in repos.items():
         dest_dir = (mirror / prefix) if prefix else mirror
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        if not dry_run:
+            dest_dir.mkdir(parents=True, exist_ok=True)
 
         # .hgeol -> .gitattributes
         ga_content = _gitattributes_from_hgeol(repo_path / ".hgeol")
@@ -656,10 +692,8 @@ def apply_git_metadata(mirror: Path, repos: dict, dry_run: bool = False) -> None
 
     for path in staged:
         run_cmd(["git", "-c", "core.autocrlf=false", "add", path], cwd=mirror)
-    run_cmd(
-        ["git", "commit", "-m", "Add Git metadata (translated from .hgeol and .hgignore)"],
-        cwd=mirror,
-    )
+    commit_staged(mirror, "Add Git metadata (translated from .hgeol and .hgignore)",
+                  redact=redact)
 
 # ---------------------------------------------------------------------------
 # State management
@@ -694,7 +728,8 @@ def resolve_excludes(saved: list, add: list, remove: list) -> list:
             result.append(pat)
     return result
 
-def remove_excluded_from_mirror(mirror: Path, patterns: list, dry_run: bool = False) -> bool:
+def remove_excluded_from_mirror(mirror: Path, patterns: list, dry_run: bool = False,
+                                redact: Optional[list] = None) -> bool:
     """
     Delete tracked files matching newly added exclude patterns from the mirror
     and commit the removal. Earlier history is left untouched.
@@ -724,9 +759,9 @@ def remove_excluded_from_mirror(mirror: Path, patterns: list, dry_run: bool = Fa
                  f"--pathspec-from-file={pathspec_file}", "--pathspec-file-nul"], cwd=mirror)
     finally:
         os.unlink(pathspec_file)
-    run_cmd(["git", "commit", "-m", f"Stop mirroring: {', '.join(patterns)}"], cwd=mirror)
+    committed = commit_staged(mirror, "Update mirror exclusions", redact=redact)
     print()
-    return True
+    return committed
 
 def write_refresh_bat(mirror: Path, hg_root: Path, remote: str) -> None:
     """
@@ -772,6 +807,10 @@ def sync_mirror(args: argparse.Namespace) -> None:
 
     # --- Load state ---
     state = load_state(mirror, state_override)
+    saved_redact = state.get("redact", [])
+    redact = resolve_redactions(saved_redact, args.redact)
+    redact_changed = redact != saved_redact
+    state["redact"] = redact
 
     # --- Resolve exclude patterns (persisted in state) ---
     saved_excludes = state.get("excludes", [])
@@ -802,7 +841,8 @@ def sync_mirror(args: argparse.Namespace) -> None:
     if not args.init:
         added = [pat for pat in excludes if pat not in saved_excludes]
         if added:
-            removed = remove_excluded_from_mirror(mirror, added, dry_run=dry_run)
+            removed = remove_excluded_from_mirror(mirror, added, dry_run=dry_run,
+                                                   redact=redact)
 
     # --- Collect all new commits across all repos ---
     print("Collecting new commits...")
@@ -835,7 +875,7 @@ def sync_mirror(args: argparse.Namespace) -> None:
 
     if not all_commits and not removed:
         print("\nNothing to sync. Mirror is up to date.")
-        if excludes_changed and not dry_run:
+        if (excludes_changed or redact_changed) and not dry_run:
             save_state(mirror, state_override, state)
         return
 
@@ -844,58 +884,53 @@ def sync_mirror(args: argparse.Namespace) -> None:
 
     # --- Apply each commit ---
     applied = 0
-    latest_hashes: dict = {}  # prefix -> hash of last successfully applied commit
-    blocked_prefixes: set = set()
+    skipped = 0
 
     for date_str, prefix, repo_path, rev_hash, author, message in all_commits:
-        if prefix in blocked_prefixes:
-            continue
-
         label = f'"{prefix}"' if prefix else "(root)"
         short_hash = rev_hash[:12]
-        print(f"  [{date_str}] {label} {short_hash}  {message[:60]}")
+        print(f"  [{date_str}] {label} {short_hash}  {message_subject(message, redact)[:60]}")
 
         if args.init or prefix in snapshot_prefixes:
             # In init mode always use full snapshots - diffs can't apply cleanly
             # against a partial history (we're only seeding the last N commits).
-            apply_snapshot_commit(mirror, repo_path, rev_hash, prefix,
-                                  author, date_str, message,
-                                  all_prefixes=set(repos.keys()),
-                                  excludes=excludes,
-                                  dry_run=dry_run)
-            applied += 1
-            latest_hashes[prefix] = rev_hash
+            committed = apply_snapshot_commit(
+                mirror, repo_path, rev_hash, prefix, author, date_str, message,
+                all_prefixes=set(repos.keys()), excludes=excludes,
+                dry_run=dry_run, redact=redact,
+            )
         else:
             patch_bytes = export_hg_patch(repo_path, rev_hash)
             rewritten = rewrite_patch_paths(patch_bytes, prefix, excludes)
-            if not patch_has_changes(rewritten):
-                # Only excluded or HG metadata files changed - nothing to commit,
-                # but advance the state past this changeset.
-                print("    (skipped: only excluded/hg-metadata changes)")
-                latest_hashes[prefix] = rev_hash
-                continue
-            ok = apply_patch(mirror, rewritten, dry_run=dry_run)
-            if ok:
-                applied += 1
-                latest_hashes[prefix] = rev_hash
-            else:
-                blocked_prefixes.add(prefix)
+            committed = False
+            if apply_patch(mirror, rewritten, dry_run=dry_run):
+                committed = commit_staged(mirror, message, author, date_str,
+                                          redact, dry_run=dry_run)
+
+        if committed:
+            applied += 1
+        else:
+            skipped += 1
+            print("    (skipped: no included changes)")
+        # Persist successful/skipped revisions immediately. A later failure must
+        # not lose progress or cause already imported commits to be retried.
+        state["repos"][prefix] = rev_hash
+        if not dry_run:
+            save_state(mirror, state_override, state)
 
     # --- Apply Git metadata files last (initial setup only) ---
     # Done after history so snapshot commits don't wipe out the generated files.
     if args.init:
-        apply_git_metadata(mirror, repos, dry_run=dry_run)
+        apply_git_metadata(mirror, repos, dry_run=dry_run, redact=redact)
 
     # --- Update state ---
-    for prefix, rev_hash in latest_hashes.items():
-        state["repos"][prefix] = rev_hash
-
     if not dry_run:
         save_state(mirror, state_override, state)
     else:
         print(f"\n  [dry-run] save state to {state_file_path(mirror, state_override)}")
 
-    print(f"\nApplied {applied} of {len(all_commits)} commit(s).")
+    qualifier = " (snapshot counts are estimates in dry-run mode)" if dry_run else ""
+    print(f"\nApplied {applied}; skipped {skipped} of {len(all_commits)} commit(s).{qualifier}")
 
     # --- Push to GitHub ---
     if args.remote:
@@ -958,7 +993,8 @@ def _short_desc(repos: dict, state: dict) -> list:
                                         extra_args=["-r", h])
                 if revs:
                     rev = revs[0]
-                    rows.append((label, h[:12], rev["message"][:55], rev["date"][:10]))
+                    subject = message_subject(rev["message"], state.get("redact", []))
+                    rows.append((label, h[:12], subject[:55], rev["date"][:10]))
                     continue
             except Exception:
                 pass
@@ -1010,6 +1046,7 @@ def run_interactive(args: argparse.Namespace) -> None:
         state = load_state(mirror, state_override)
         state["excludes"] = resolve_excludes(state.get("excludes", []),
                                              args.exclude, args.unexclude)
+        state["redact"] = resolve_redactions(state.get("redact", []), args.redact)
         repos, _excluded = filter_repos(discover_subrepos(hg_root), state["excludes"])
         cur_remote = _get_remote_url(mirror) or remote
 
@@ -1045,7 +1082,7 @@ def run_interactive(args: argparse.Namespace) -> None:
                 root=str(hg_root), mirror=str(mirror), remote=cur_remote,
                 recent_commits=n, init=True, dry_run=False,
                 state_file=str(state_override) if state_override else "",
-                exclude=args.exclude, unexclude=args.unexclude,
+                exclude=args.exclude, unexclude=args.unexclude, redact=args.redact,
             )
             try:
                 sync_mirror(sub)
@@ -1058,7 +1095,7 @@ def run_interactive(args: argparse.Namespace) -> None:
                 root=str(hg_root), mirror=str(mirror), remote="",
                 recent_commits=args.recent_commits, init=False, dry_run=False,
                 state_file=str(state_override) if state_override else "",
-                exclude=args.exclude, unexclude=args.unexclude,
+                exclude=args.exclude, unexclude=args.unexclude, redact=args.redact,
             )
             try:
                 sync_mirror(sub)
@@ -1074,7 +1111,7 @@ def run_interactive(args: argparse.Namespace) -> None:
                     root=str(hg_root), mirror=str(mirror), remote=cur_remote,
                     recent_commits=args.recent_commits, init=False, dry_run=False,
                     state_file=str(state_override) if state_override else "",
-                    exclude=args.exclude, unexclude=args.unexclude,
+                    exclude=args.exclude, unexclude=args.unexclude, redact=args.redact,
                 )
                 # Push only - fake an already-synced run by setting all counts to 0
                 # by directly calling the push logic
@@ -1093,7 +1130,7 @@ def run_interactive(args: argparse.Namespace) -> None:
                 root=str(hg_root), mirror=str(mirror), remote=cur_remote,
                 recent_commits=args.recent_commits, init=False, dry_run=False,
                 state_file=str(state_override) if state_override else "",
-                exclude=args.exclude, unexclude=args.unexclude,
+                exclude=args.exclude, unexclude=args.unexclude, redact=args.redact,
             )
             try:
                 sync_mirror(sub)
@@ -1173,6 +1210,11 @@ def main() -> None:
     parser.add_argument(
         "--unexclude", action="append", default=[], metavar="PATH",
         help="Remove a previously saved exclude pattern (repeatable).",
+    )
+    parser.add_argument(
+        "--redact", action="append", type=redaction_term, default=[], metavar="TEXT",
+        help="Replace literal text in commit messages with *** (case-insensitive, "
+             "repeatable). Saved in the state file for later syncs.",
     )
     parser.add_argument(
         "--state-file", default="", metavar="PATH",
